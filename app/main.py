@@ -1,6 +1,6 @@
 import os
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, date, timedelta, timezone
 from typing import Optional, List, Any, Dict, Annotated
 
 from dotenv import load_dotenv
@@ -98,6 +98,28 @@ def compute_late_minutes(punch_in_utc: datetime, shift_start: str, attendance_da
     if elapsed_seconds > 10 * 60:
         return int(elapsed_seconds // 60)
     return 0
+
+def is_valid_calendar_date(d: str) -> bool:
+    if not isinstance(d, str):
+        return False
+    parts = d.split("-")
+    if len(parts) != 3 or len(parts[0]) != 4 or len(parts[1]) != 2 or len(parts[2]) != 2:
+        return False
+    try:
+        date.fromisoformat(d)
+        return True
+    except ValueError:
+        return False
+
+def get_month_range(month_str: str) -> tuple[str, str]:
+    """Returns (start_date_inclusive, next_month_start_exclusive) as YYYY-MM-DD strings."""
+    y, m = map(int, month_str.split("-"))
+    start_date = f"{month_str}-01"
+    if m == 12:
+        next_month_start = f"{y + 1:04d}-01-01"
+    else:
+        next_month_start = f"{y:04d}-{m + 1:02d}-01"
+    return start_date, next_month_start
 
 def compute_overtime_minutes(punch_out_utc: datetime, shift_start: str, shift_end: str, attendance_date: str) -> int:
     """R3 overtime-minute calculation."""
@@ -287,6 +309,7 @@ class Trend(BaseModel):
     items: List[TrendItem]
 
 def build_employee_monthly_pipeline(emp_code: str, month: str):
+    start_date, next_month_start = get_month_range(month)
     return [
         {"$match": {"emp_code": emp_code}},
         {"$lookup": {
@@ -297,8 +320,8 @@ def build_employee_monthly_pipeline(emp_code: str, month: str):
                     "$expr": {
                         "$and": [
                             {"$eq": ["$emp_code", "$$e_code"]},
-                            {"$gte": ["$date", f"{month}-01"]},
-                            {"$lte": ["$date", f"{month}-31"]}
+                            {"$gte": ["$date", start_date]},
+                            {"$lt": ["$date", next_month_start]}
                         ]
                     }
                 }}
@@ -406,6 +429,7 @@ def get_employee_monthly(emp_code: str, month: str = Query(pattern=r"^\d{4}-(0[1
     return result[0]
 
 def build_department_summary_pipeline(month: str, department: Optional[str] = None):
+    start_date, next_month_start = get_month_range(month)
     pipeline = []
     if department:
         pipeline.append({"$match": {"department": department}})
@@ -419,8 +443,8 @@ def build_department_summary_pipeline(month: str, department: Optional[str] = No
                     "$expr": {
                         "$and": [
                             {"$eq": ["$emp_code", "$$e_code"]},
-                            {"$gte": ["$date", f"{month}-01"]},
-                            {"$lte": ["$date", f"{month}-31"]}
+                            {"$gte": ["$date", start_date]},
+                            {"$lt": ["$date", next_month_start]}
                         ]
                     }
                 }}
@@ -428,7 +452,7 @@ def build_department_summary_pipeline(month: str, department: Optional[str] = No
             "as": "logs"
         }},
         {"$addFields": {
-            "next_month_start": {"$dateToString": {"format": "%Y-%m-%d", "date": {"$dateAdd": {"startDate": {"$dateFromString": {"dateString": f"{month}-01T00:00:00Z"}}, "unit": "month", "amount": 1}}}}
+            "next_month_start": next_month_start
         }},
         {"$match": {
             "$expr": {"$lt": ["$joined_on", "$next_month_start"]}
@@ -539,9 +563,10 @@ def get_department_summary(month: str = Query(pattern=r"^\d{4}-(0[1-9]|1[0-2])$"
     return {"month": month, "items": items}
 
 def build_late_leaderboard_pipeline(month: str, limit: int, department: Optional[str] = None):
+    start_date, next_month_start = get_month_range(month)
     pipeline = [
         {"$match": {
-            "date": {"$gte": f"{month}-01", "$lte": f"{month}-31"}
+            "date": {"$gte": start_date, "$lt": next_month_start}
         }},
         {"$group": {
             "_id": "$emp_code",
@@ -737,11 +762,14 @@ def get_department_trend(
     from_date: str = Query(alias="from", pattern=r"^\d{4}-\d{2}-\d{2}$"),
     to_date: str = Query(alias="to", pattern=r"^\d{4}-\d{2}-\d{2}$")
 ):
+    if not is_valid_calendar_date(from_date) or not is_valid_calendar_date(to_date):
+        raise HTTPException(422, "Invalid date in range")
+
     if from_date > to_date:
         raise HTTPException(422, "to cannot be before from")
         
-    start_dt = datetime.fromisoformat(from_date)
-    end_dt = datetime.fromisoformat(to_date)
+    start_dt = date.fromisoformat(from_date)
+    end_dt = date.fromisoformat(to_date)
     if (end_dt - start_dt).days > 92:
         raise HTTPException(422, "date range exceeds 92 days")
         
@@ -775,9 +803,9 @@ def explain_endpoint(
         raise HTTPException(422, "Invalid endpoint")
 
     if endpoint == "attendance_list":
-        if date_from and not date_regex.match(date_from):
+        if date_from and not is_valid_calendar_date(date_from):
             raise HTTPException(422, "Invalid date_from format")
-        if date_to and not date_regex.match(date_to):
+        if date_to and not is_valid_calendar_date(date_to):
             raise HTTPException(422, "Invalid date_to format")
         if date_from and date_to and date_from > date_to:
             raise HTTPException(422, "date_from cannot be after date_to")
@@ -858,14 +886,14 @@ def explain_endpoint(
         if not to_date:
             raise HTTPException(422, "to is required for department_trend")
             
-        if not date_regex.match(from_date) or not date_regex.match(to_date):
+        if not is_valid_calendar_date(from_date) or not is_valid_calendar_date(to_date):
             raise HTTPException(422, "Invalid format for from/to dates")
             
         if from_date > to_date:
             raise HTTPException(422, "to cannot be before from")
             
-        start_dt = datetime.fromisoformat(from_date)
-        end_dt = datetime.fromisoformat(to_date)
+        start_dt = date.fromisoformat(from_date)
+        end_dt = date.fromisoformat(to_date)
         if (end_dt - start_dt).days > 92:
             raise HTTPException(422, "date range exceeds 92 days")
             
@@ -972,13 +1000,23 @@ def punch_out(body: PunchOutRequest):
     candidate = db.attendance_logs.find_one(
         {
             "emp_code": body.emp_code,
-            "punch_in": {"$ne": None},
+            "punch_in": {"$lte": punch_out_utc, "$ne": None},
             "punch_out": None
         },
         sort=[("punch_in", -1)]
     )
     
     if not candidate:
+        future_open = db.attendance_logs.find_one(
+            {
+                "emp_code": body.emp_code,
+                "punch_in": {"$ne": None},
+                "punch_out": None
+            },
+            sort=[("punch_in", 1)]
+        )
+        if future_open:
+            raise HTTPException(status_code=422, detail="punch_out must be after punch_in")
         raise HTTPException(status_code=404, detail="No eligible open punch-in record found")
         
     punch_in_utc = candidate["punch_in"]
@@ -1046,12 +1084,9 @@ def list_attendance(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100)
 ):
-    import re
-    date_regex = re.compile(r"^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$")
-    
-    if date_from and not date_regex.match(date_from):
+    if date_from and not is_valid_calendar_date(date_from):
         raise HTTPException(422, "Invalid date_from format")
-    if date_to and not date_regex.match(date_to):
+    if date_to and not is_valid_calendar_date(date_to):
         raise HTTPException(422, "Invalid date_to format")
         
     if date_from and date_to and date_from > date_to:
@@ -1091,6 +1126,9 @@ def list_attendance(
 
 @app.patch("/attendance/{emp_code}/{date}", response_model=AttendanceRecord)
 def regularize_attendance(emp_code: str, date: str, body: RegularizeRequest):
+    if not is_valid_calendar_date(date):
+        raise HTTPException(422, "Invalid date format")
+
     emp = db.employees.find_one({"emp_code": emp_code})
     if not emp:
         raise HTTPException(status_code=404, detail="Employee not found")
