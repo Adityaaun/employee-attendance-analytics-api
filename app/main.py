@@ -343,7 +343,13 @@ def build_employee_monthly_pipeline(emp_code: str, month: str):
             "present_days": {
                 "$sum": {
                     "$cond": [
-                        {"$in": [{"$ifNull": ["$logs.status", ""]}, ["PRESENT", "WFH", "ON_DUTY"]]},
+                        {"$and": [
+                            {"$in": [{"$ifNull": ["$logs.status", ""]}, ["PRESENT", "WFH", "ON_DUTY"]]},
+                            {"$in": [
+                                {"$isoDayOfWeek": {"$dateFromString": {"dateString": {"$concat": [{"$ifNull": ["$logs.date", "1970-01-01"]}, "T00:00:00Z"]}}}},
+                                [1, 2, 3, 4, 5]
+                            ]}
+                        ]},
                         {"$cond": [{"$eq": [{"$ifNull": ["$logs.half_day", False]}, True]}, 0.5, 1]},
                         0
                     ]
@@ -434,7 +440,13 @@ def build_department_summary_pipeline(month: str, department: Optional[str] = No
             "present_days": {
                 "$sum": {
                     "$cond": [
-                        {"$in": [{"$ifNull": ["$logs.status", ""]}, ["PRESENT", "WFH", "ON_DUTY"]]},
+                        {"$and": [
+                            {"$in": [{"$ifNull": ["$logs.status", ""]}, ["PRESENT", "WFH", "ON_DUTY"]]},
+                            {"$in": [
+                                {"$isoDayOfWeek": {"$dateFromString": {"dateString": {"$concat": [{"$ifNull": ["$logs.date", "1970-01-01"]}, "T00:00:00Z"]}}}},
+                                [1, 2, 3, 4, 5]
+                            ]}
+                        ]},
                         {"$cond": [{"$eq": [{"$ifNull": ["$logs.half_day", False]}, True]}, 0.5, 1]},
                         0
                     ]
@@ -586,10 +598,10 @@ def build_department_trend_pipeline(department: str, from_date: str, to_date: st
         {"$match": {"department": department}},
         {"$limit": 1},
         {"$project": {"_id": 0}},
-        {"$addFields": {"dates": [
+        {"$addFields": {"dates": {"$setUnion": [[
             {"$dateFromString": {"dateString": f"{from_date}T00:00:00Z"}},
             {"$dateFromString": {"dateString": f"{to_date}T00:00:00Z"}}
-        ]}},
+        ]]}}},
         {"$unwind": "$dates"},
         {"$project": {"date": "$dates"}},
         {"$densify": {
@@ -1150,10 +1162,10 @@ def regularize_attendance(emp_code: str, date: str, body: RegularizeRequest):
         changes["status"] = {"from": old_status, "to": new_status}
     
     if new_punch_in != old_punch_in:
-        changes["punch_in"] = {"from": serialize_epoch(old_punch_in), "to": serialize_epoch(new_punch_in)}
+        changes["punch_in"] = {"from": old_punch_in, "to": new_punch_in}
         
     if new_punch_out != old_punch_out:
-        changes["punch_out"] = {"from": serialize_epoch(old_punch_out), "to": serialize_epoch(new_punch_out)}
+        changes["punch_out"] = {"from": old_punch_out, "to": new_punch_out}
         
     if new_work_hours != old_work_hours:
         changes["work_hours"] = {"from": old_work_hours, "to": new_work_hours}
@@ -1171,7 +1183,7 @@ def regularize_attendance(emp_code: str, date: str, body: RegularizeRequest):
         raise HTTPException(422, "Request produces no actual changes")
         
     audit_entry = {
-        "at": int(datetime.now(timezone.utc).timestamp() * 1000),
+        "at": datetime.now(timezone.utc),
         "by": body.regularized_by,
         "reason": body.reason,
         "changes": changes
